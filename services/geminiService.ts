@@ -2,9 +2,23 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { Campaign, ScalingStrategy } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// Get API key from environment (Vite uses import.meta.env)
+const getApiKey = () => {
+  return import.meta.env.VITE_GEMINI_API_KEY || 
+         import.meta.env.GEMINI_API_KEY || 
+         (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) ||
+         '';
+};
+
+const apiKey = getApiKey();
+const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
 
 export const analyzeCampaignsForScaling = async (campaigns: Campaign[]) => {
+  if (!ai) {
+    console.warn('Gemini API key not configured');
+    return [];
+  }
+  
   const activeSurfCampaigns = campaigns.filter(c => c.isSurfScaling && c.status === 'ACTIVE');
   if (activeSurfCampaigns.length === 0) return [];
 
@@ -50,6 +64,11 @@ export const analyzeCampaignsForScaling = async (campaigns: Campaign[]) => {
 };
 
 export const generateScalingStrategy = async (campaigns: Campaign[]): Promise<ScalingStrategy | null> => {
+  if (!ai) {
+    console.warn('Gemini API key not configured');
+    return null;
+  }
+  
   if (campaigns.length === 0) return null;
 
   const context = campaigns.map(c => ({
