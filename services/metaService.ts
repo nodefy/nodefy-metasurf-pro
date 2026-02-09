@@ -5,7 +5,7 @@ const API_VERSION = "v21.0";
 const TOKEN_KEY = 'metasurf_api_token';
 
 const getStoredToken = () => {
-  return localStorage.getItem(TOKEN_KEY) || '';
+  return import.meta.env.VITE_META_ACCESS_TOKEN || localStorage.getItem(TOKEN_KEY) || '';
 };
 
 export const saveToken = async (token: string) => {
@@ -68,8 +68,15 @@ export const fetchMetaCampaignsForAccount = async (accountId: string, period: Da
       return { data: [], error: campaignsData.error.message };
     }
 
-    // Fetch Insights
-    const insightsUrl = `https://graph.facebook.com/${API_VERSION}/${accountId}/insights?fields=campaign_id,spend,purchase_roas,conversions,actions,cpc,inline_link_click_ctr&level=campaign&date_preset=${period}&access_token=${token}`;
+    // Fetch Insights - Map period to Meta API format
+    const periodMap: Record<DatePeriod, string> = {
+      'today': 'today',
+      'yesterday': 'yesterday',
+      'last_7d': 'last_7d'
+    };
+    const metaPeriod = periodMap[period] || 'today';
+    
+    const insightsUrl = `https://graph.facebook.com/${API_VERSION}/${accountId}/insights?fields=campaign_id,spend,purchase_roas,conversions,actions,cpc,inline_link_click_ctr&level=campaign&date_preset=${metaPeriod}&access_token=${token}`;
     const insightsResponse = await fetch(insightsUrl);
     const insightsData = await insightsResponse.json();
 

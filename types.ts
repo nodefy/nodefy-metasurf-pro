@@ -1,5 +1,5 @@
 
-export type DatePeriod = 'today' | 'yesterday';
+export type DatePeriod = 'today' | 'yesterday' | 'last_7d';
 
 export interface AccountSettings {
   minRoas: number;
@@ -30,6 +30,7 @@ export interface Campaign {
   conversions: number;
   status: 'ACTIVE' | 'PAUSED';
   isSurfScaling: boolean;
+  isStarred?: boolean;
   minRoas: number;
   objective: string;
 }
@@ -53,6 +54,7 @@ export interface ScalingPhase {
 export type Interval = '1H' | '3H' | '6H' | 'CUSTOM';
 
 export interface SurfSchedule {
+  id?: string; // Standard key for singleton or grouped schedules
   enabled: boolean;
   interval: Interval;
   specificHours: number[]; // e.g., [9, 12, 15]
@@ -89,7 +91,8 @@ export enum AppTab {
   ACCOUNTS = 'ACCOUNTS',
   DASHBOARD = 'DASHBOARD', // Merged Dashboard & Surf Center
   SETTINGS = 'SETTINGS',
-  NOTIFICATIONS = 'NOTIFICATIONS'
+  NOTIFICATIONS = 'NOTIFICATIONS',
+  SCALESURFING = 'SCALESURFING'
 }
 
 export type MetricType = 'ROAS' | 'CPA' | 'SPEND' | 'CTR';

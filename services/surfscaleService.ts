@@ -56,14 +56,13 @@ export const evaluateRules = (campaign: Campaign, rules: Rule[]): SurfLog | null
             return {
                 id: crypto.randomUUID(),
                 campaignId: campaign.id,
+                campaignName: campaign.name,
+                ruleId: rule.id,
                 timestamp: Date.now(),
                 action: rule.name, // e.g. "Rule: High ROAS applied"
                 oldBudget,
                 newBudget,
-                metricSnapshot: {
-                    roas: hourlyMetrics.roas,
-                    cpa: hourlyMetrics.cpa
-                }
+                metricValue: hourlyMetrics.roas || hourlyMetrics.cpa || hourlyMetrics.spend
             };
         }
     }

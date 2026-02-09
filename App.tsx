@@ -9,7 +9,10 @@ import DashboardStats from './components/DashboardStats';
 import SurfClock from './components/SurfClock';
 
 import { Interval } from './types';
-import { getSetting, saveSetting } from './services/db';
+import { getSetting, saveSetting, getStarredCampaigns, toggleStarCampaign } from './services/db';
+import { sendWebhookEmail, generateScheduleEmail } from './services/emailService';
+import { generateAdviceReport, generatePDFReport, sendReportEmail } from './services/reportService';
+import { analyzeAccount } from './services/accountAnalysisService';
 
 const DB_KEY = 'metasurf_stable_v12';
 
@@ -48,10 +51,17 @@ const App: React.FC = () => {
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [accountError, setAccountError] = useState<string | null>(null);
 
-  // Filters State
-  const [filterObjective, setFilterObjective] = useState<string>('ALL');
-  const [filterActiveOnly, setFilterActiveOnly] = useState<boolean>(false);
+  // Filters State - Defaults
+  const [filterObjective, setFilterObjective] = useState<string>('SALES');
+  const [filterStatus, setFilterStatus] = useState<string>('ACTIVE');
+  const [filterActiveOnly, setFilterActiveOnly] = useState<boolean>(true);
   const [filterMinSpend, setFilterMinSpend] = useState<number>(0);
+  const [filterMinRoas, setFilterMinRoas] = useState<number>(0);
+  const [filterMaxCpa, setFilterMaxCpa] = useState<number>(10000);
+  const [filterSurfScaling, setFilterSurfScaling] = useState<string>('ALL'); // ALL, YES, NO
+  const [campaignSearch, setCampaignSearch] = useState<string>('');
+  const [sortBy, setSortBy] = useState<string>('spend'); // spend, roas, cpa, name
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
 
   // Accounts UI State
   const [showOtherAccounts, setShowOtherAccounts] = useState(false);
@@ -73,20 +83,26 @@ const App: React.FC = () => {
   const [scheduleInterval, setScheduleInterval] = useState<Interval>('1H');
   const [activeHours, setActiveHours] = useState<number[]>(Array.from({ length: 24 }, (_, i) => i)); // Default 1H = all hours
 
-  const updateSchedule = useCallback((interval: Interval) => {
+  const updateSchedule = useCallback(async (interval: Interval) => {
     setScheduleInterval(interval);
     let newHours: number[] = [];
     if (interval === '1H') newHours = Array.from({ length: 24 }, (_, i) => i);
     else if (interval === '3H') newHours = Array.from({ length: 8 }, (_, i) => i * 3);
     else if (interval === '6H') newHours = [0, 6, 12, 18];
-    else newHours = activeHours; // Keep current for CUSTOM
+    else newHours = activeHours;
 
     setActiveHours(newHours);
+    await saveSetting('schedule_interval', interval);
+    await saveSetting('schedule_hours', newHours);
   }, [activeHours]);
 
-  const toggleCustomHour = (hour: number) => {
+  const toggleCustomHour = async (hour: number) => {
     if (scheduleInterval !== 'CUSTOM') return;
-    setActiveHours(prev => prev.includes(hour) ? prev.filter(h => h !== hour) : [...prev, hour]);
+    const nextHours = activeHours.includes(hour)
+      ? activeHours.filter(h => h !== hour)
+      : [...activeHours, hour];
+    setActiveHours(nextHours);
+    await saveSetting('schedule_hours', nextHours);
   };
 
   // Surfscale State
@@ -161,9 +177,11 @@ const App: React.FC = () => {
         setAccountError(error);
       } else {
         const db = getDB();
+        const starredIds = await getStarredCampaigns(accountId);
         setCampaigns(data.map(c => ({
           ...c,
-          isSurfScaling: db.campaigns[c.id]?.isSurfScaling || false
+          isSurfScaling: db.campaigns[c.id]?.isSurfScaling || false,
+          isStarred: starredIds.includes(c.id)
         })));
       }
     } catch (e) {
@@ -174,12 +192,19 @@ const App: React.FC = () => {
   }, [getDB]);
 
   useEffect(() => {
-    // Load Settings from DB
+    // Load Settings & Schedule from DB
     const loadSettings = async () => {
       const token = await getSetting<string>('api_token', '');
       setApiTokenInput(token);
-      const webhook = await getSetting<string>('webhook_url', '');
-      setWebhookUrl(webhook);
+      // Default Make.com webhook URL if not set
+      const defaultWebhook = 'https://hook.eu1.make.com/6g8jta9799el82t7rg0i3enx8rh2ey62';
+      const webhook = await getSetting<string>('webhook_url', defaultWebhook);
+      setWebhookUrl(webhook || defaultWebhook);
+
+      const interval = await getSetting<Interval>('schedule_interval', '1H');
+      setScheduleInterval(interval);
+      const hours = await getSetting<number[]>('schedule_hours', Array.from({ length: 24 }, (_, i) => i));
+      setActiveHours(hours);
     };
     loadSettings();
   }, []);
@@ -191,6 +216,37 @@ const App: React.FC = () => {
   useEffect(() => {
     if (selectedAccountId) syncCampaigns(selectedAccountId, selectedPeriod);
   }, [selectedAccountId, selectedPeriod, syncCampaigns]);
+
+  // Background scheduler - runs automatically based on activeHours
+  useEffect(() => {
+    if (!isLoggedIn || activeHours.length === 0 || campaigns.length === 0) return;
+
+    let lastCheckedHour = -1;
+
+    const checkAndRun = () => {
+      const now = new Date();
+      const currentHour = now.getHours();
+      const currentMinute = now.getMinutes();
+      
+      // Check if current hour is in activeHours and it's the start of the hour (minute 0-1)
+      // Only run once per hour
+      if (activeHours.includes(currentHour) && currentMinute <= 1 && lastCheckedHour !== currentHour) {
+        lastCheckedHour = currentHour;
+        console.log('🔄 Scheduled check triggered at', currentHour + ':00');
+        // Use the latest campaigns and rules from state
+        runSurfAnalysis(true);
+      }
+    };
+
+    // Check immediately on mount if it's a scheduled hour
+    checkAndRun();
+
+    // Check every minute
+    const interval = setInterval(checkAndRun, 60000); // 60000ms = 1 minute
+
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoggedIn, activeHours.length, campaigns.length]);
 
   const toggleStar = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
@@ -216,13 +272,75 @@ const App: React.FC = () => {
   };
 
   const filteredCampaigns = useMemo(() => {
-    return campaigns.filter(c => {
-      const matchObjective = filterObjective === 'ALL' || c.objective.includes(filterObjective);
+    let filtered = campaigns.filter(c => {
+      // Objective filter - check if objective contains the filter value or matches exactly
+      const matchObjective = filterObjective === 'ALL' || 
+        c.objective.toUpperCase().includes(filterObjective.toUpperCase()) ||
+        (filterObjective === 'SALES' && (c.objective.includes('SALES') || c.objective.includes('OUTCOME_SALES'))) ||
+        (filterObjective === 'AWARENESS' && c.objective.includes('AWARENESS')) ||
+        (filterObjective === 'TRAFFIC' && c.objective.includes('TRAFFIC'));
+      
+      // Status filter
+      const matchStatus = filterStatus === 'ALL' || c.status === filterStatus;
+      
+      // Active only filter
       const matchActive = !filterActiveOnly || c.status === 'ACTIVE';
+      
+      // Spend filter
       const matchSpend = Number(c.spend) >= filterMinSpend;
-      return matchObjective && matchActive && matchSpend;
+      
+      // ROAS filter
+      const matchRoas = Number(c.roas) >= filterMinRoas;
+      
+      // CPA filter
+      const matchCpa = Number(c.cpa) <= filterMaxCpa || c.cpa === 0;
+      
+      // Surf Scaling filter
+      const matchSurfScaling = filterSurfScaling === 'ALL' || 
+        (filterSurfScaling === 'YES' && c.isSurfScaling) ||
+        (filterSurfScaling === 'NO' && !c.isSurfScaling);
+      
+      // Search filter
+      const matchSearch = campaignSearch === '' || 
+        c.name.toLowerCase().includes(campaignSearch.toLowerCase());
+      
+      return matchObjective && matchStatus && matchActive && matchSpend && matchRoas && matchCpa && matchSurfScaling && matchSearch;
     });
-  }, [campaigns, filterObjective, filterActiveOnly, filterMinSpend]);
+    
+    // Sorting
+    filtered.sort((a, b) => {
+      let aVal: any, bVal: any;
+      switch (sortBy) {
+        case 'spend':
+          aVal = a.spend;
+          bVal = b.spend;
+          break;
+        case 'roas':
+          aVal = a.roas;
+          bVal = b.roas;
+          break;
+        case 'cpa':
+          aVal = a.cpa || 0;
+          bVal = b.cpa || 0;
+          break;
+        case 'name':
+          aVal = a.name.toLowerCase();
+          bVal = b.name.toLowerCase();
+          break;
+        default:
+          aVal = a.spend;
+          bVal = b.spend;
+      }
+      
+      if (sortOrder === 'asc') {
+        return aVal > bVal ? 1 : aVal < bVal ? -1 : 0;
+      } else {
+        return aVal < bVal ? 1 : aVal > bVal ? -1 : 0;
+      }
+    });
+    
+    return filtered;
+  }, [campaigns, filterObjective, filterStatus, filterActiveOnly, filterMinSpend, filterMinRoas, filterMaxCpa, filterSurfScaling, campaignSearch, sortBy, sortOrder]);
 
   const handleSurfToggle = async (id: string) => {
     const campaign = campaigns.find(c => c.id === id);
@@ -248,7 +366,17 @@ const App: React.FC = () => {
     }
   };
 
-  const runSurfAnalysis = () => {
+  const handleStarToggle = async (e: React.MouseEvent, campaignId: string) => {
+    e.stopPropagation();
+    if (!selectedAccountId) return;
+
+    const isStarred = await toggleStarCampaign(campaignId, selectedAccountId);
+    setCampaigns(prev => prev.map(c => 
+      c.id === campaignId ? { ...c, isStarred } : c
+    ));
+  };
+
+  const runSurfAnalysis = async (isScheduled: boolean = false) => {
     let newLogs: SurfLog[] = [];
     let affectedCampaignsCount = 0;
 
@@ -281,6 +409,64 @@ const App: React.FC = () => {
       setAnalysisSummary(`
         **Surf Rapport (${timestamp}):** Alles rustig. De engine heeft **${monitoringCount} campagnes** geanalyseerd tegen **${activeRulesCount} regels**, maar geen afwijkingen gevonden die actie vereisen. De huidige performance valt binnen de gewenste marges.
       `);
+    }
+
+    // Send email for scheduled checks
+    if (isScheduled) {
+      try {
+        const emailData = await generateScheduleEmail(campaigns, [...newLogs, ...surfLogs], activeHours);
+        await sendWebhookEmail(emailData);
+      } catch (error) {
+        console.error('Failed to send schedule email:', error);
+      }
+    }
+  };
+
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false);
+  const [accountAnalysis, setAccountAnalysis] = useState<any>(null);
+
+  const handleGenerateReport = async () => {
+    if (!activeAccount || !selectedAccountId) return;
+    
+    setIsGeneratingReport(true);
+    try {
+      const periodLabel = selectedPeriod === 'today' ? 'Vandaag' : selectedPeriod === 'yesterday' ? 'Gisteren' : 'Laatste 7 dagen';
+      const reportData = await generateAdviceReport(activeAccount.name, periodLabel, campaigns);
+      
+      // Generate and download PDF
+      generatePDFReport(reportData);
+      
+      // Send email
+      await sendReportEmail(reportData);
+      
+      setNotifications(prev => [{
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        message: 'Adviesrapport gegenereerd en verzonden',
+        details: `Het rapport voor ${activeAccount.name} is gegenereerd en per email verzonden naar Benjamin@nodefy.nl`,
+        isRead: false,
+        type: 'SYSTEM'
+      }, ...prev]);
+    } catch (error) {
+      console.error('Failed to generate report:', error);
+      alert('Fout bij genereren rapport. Probeer het opnieuw.');
+    } finally {
+      setIsGeneratingReport(false);
+    }
+  };
+
+  const handleAnalyzeAccount = async () => {
+    if (!selectedAccountId) return;
+    
+    setIsSyncing(true);
+    try {
+      const analysis = await analyzeAccount(selectedAccountId, campaigns);
+      setAccountAnalysis(analysis);
+    } catch (error) {
+      console.error('Failed to analyze account:', error);
+      alert('Fout bij analyseren account.');
+    } finally {
+      setIsSyncing(false);
     }
   };
 
@@ -325,6 +511,7 @@ const App: React.FC = () => {
 
         <nav className="space-y-1 flex-1">
           <SidebarItem icon={<Icons.Dashboard />} label="Dashboard" active={activeTab === AppTab.DASHBOARD} onClick={() => setActiveTab(AppTab.DASHBOARD)} />
+          <SidebarItem icon={<Icons.Campaign />} label="Scalesurfing" active={activeTab === AppTab.SCALESURFING} onClick={() => setActiveTab(AppTab.SCALESURFING)} />
           <SidebarItem icon={<Icons.Settings />} label="Accounts" active={activeTab === AppTab.ACCOUNTS} onClick={() => setActiveTab(AppTab.ACCOUNTS)} />
           <SidebarItem
             icon={<Icons.Notification />}
@@ -347,7 +534,7 @@ const App: React.FC = () => {
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 p-6 lg:p-10 max-w-6xl mx-auto w-full pb-24">
+      <main className="flex-1 p-4 sm:p-6 lg:p-8 xl:p-10 max-w-6xl mx-auto w-full pb-20 sm:pb-24">
         <header className="flex flex-col md:flex-row md:items-center justify-between mb-8 gap-4">
           <div>
             <div className="flex items-center gap-3 mb-1">
@@ -357,12 +544,12 @@ const App: React.FC = () => {
             </div>
             <div className="flex items-center gap-2">
               {activeAccount && <span className="bg-slate-900 text-white px-2 py-0.5 rounded text-[9px] font-bold uppercase">{activeAccount.name}</span>}
-              <span className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">{selectedPeriod}</span>
             </div>
           </div>
           <div className="flex items-center gap-2 bg-white p-1 rounded-xl border border-slate-100 shadow-sm">
-            <button onClick={() => setSelectedPeriod('today')} className={`px-4 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-colors ${selectedPeriod === 'today' ? 'bg-slate-900 text-white shadow-md' : 'text-slate-400 hover:text-slate-600'}`}>Vandaag</button>
-            <button onClick={() => setSelectedPeriod('yesterday')} className={`px-4 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-colors ${selectedPeriod === 'yesterday' ? 'bg-slate-900 text-white shadow-md' : 'text-slate-400 hover:text-slate-600'}`}>Gisteren</button>
+            <button onClick={() => setSelectedPeriod('today')} className={`px-3 md:px-4 py-1.5 rounded-lg text-[9px] md:text-[10px] font-bold uppercase tracking-widest transition-colors ${selectedPeriod === 'today' ? 'bg-slate-900 text-white shadow-md' : 'text-slate-400 hover:text-slate-600'}`}>Vandaag</button>
+            <button onClick={() => setSelectedPeriod('yesterday')} className={`px-3 md:px-4 py-1.5 rounded-lg text-[9px] md:text-[10px] font-bold uppercase tracking-widest transition-colors ${selectedPeriod === 'yesterday' ? 'bg-slate-900 text-white shadow-md' : 'text-slate-400 hover:text-slate-600'}`}>Gisteren</button>
+            <button onClick={() => setSelectedPeriod('last_7d')} className={`px-3 md:px-4 py-1.5 rounded-lg text-[9px] md:text-[10px] font-bold uppercase tracking-widest transition-colors ${selectedPeriod === 'last_7d' ? 'bg-slate-900 text-white shadow-md' : 'text-slate-400 hover:text-slate-600'}`}>7 Dagen</button>
             <button onClick={() => syncAccounts()} className="p-2 hover:bg-slate-50 rounded-lg transition-all text-slate-400"><Icons.Refresh /></button>
           </div>
         </header>
@@ -386,7 +573,14 @@ const App: React.FC = () => {
                     <div className="flex-1">
                       <div className="flex items-center justify-between mb-2">
                         <h4 className="font-black text-sm text-slate-800">{n.message}</h4>
-                        <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">{new Date(n.timestamp).toLocaleTimeString()}</span>
+                        <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">
+                          {new Date(n.timestamp).toLocaleString('nl-NL', { 
+                            day: '2-digit', 
+                            month: '2-digit', 
+                            hour: '2-digit', 
+                            minute: '2-digit' 
+                          })}
+                        </span>
                       </div>
                       <p className="text-xs text-slate-500 leading-relaxed font-medium">{n.details}</p>
                     </div>
@@ -398,36 +592,31 @@ const App: React.FC = () => {
 
           {activeTab === AppTab.DASHBOARD && (
             <div className="animate-slide-up space-y-8">
-              {/* Header & Date Filter */}
+              {/* Header */}
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
                 <div>
                   <h2 className="text-2xl font-black text-slate-900">Surf Dashboard</h2>
                   <p className="text-slate-400 text-xs font-bold uppercase tracking-widest">Real-time Performance & Surf Control</p>
                 </div>
-                <div className="flex bg-white p-1 rounded-xl border border-slate-100 shadow-sm">
-                  {(['today', 'yesterday', 'last_7d'] as DatePeriod[]).map(p => (
-                    <button
-                      key={p}
-                      onClick={() => setSelectedPeriod(p)}
-                      className={`px-4 py-2 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all ${selectedPeriod === p ? 'bg-slate-900 text-white shadow-md' : 'text-slate-400 hover:text-slate-600'
-                        }`}
-                    >
-                      {p.replace('_', ' ')}
-                    </button>
-                  ))}
-                </div>
+                <button
+                  onClick={handleGenerateReport}
+                  disabled={isGeneratingReport || !activeAccount}
+                  className="bg-orange-500 text-white px-4 md:px-6 py-2 md:py-3 rounded-xl text-[10px] md:text-xs font-bold uppercase tracking-widest hover:bg-orange-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-orange-500/20"
+                >
+                  {isGeneratingReport ? 'Genereren...' : 'Genereer Adviesrapport'}
+                </button>
               </div>
 
               {/* Stats Overview */}
               <DashboardStats campaigns={campaigns} period={selectedPeriod} />
 
               {/* Schedule / Clock Section */}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
-                <div className="md:col-span-1 bg-white p-6 rounded-[2.5rem] border border-slate-100 shadow-sm flex flex-col items-center justify-center">
-                  <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-6 w-full text-center">Active Schedule</h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6 lg:gap-8">
+                <div className="md:col-span-1 bg-white p-4 md:p-6 rounded-2xl md:rounded-[2.5rem] border border-slate-100 shadow-sm flex flex-col items-center justify-center">
+                  <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4 md:mb-6 w-full text-center">Active Schedule</h3>
                   <SurfClock schedule={activeHours} onToggleHour={toggleCustomHour} interval={scheduleInterval} />
                 </div>
-                <div className="md:col-span-2 bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm">
+                <div className="md:col-span-2 bg-white p-4 md:p-6 lg:p-8 rounded-2xl md:rounded-[2.5rem] border border-slate-100 shadow-sm">
                   <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-6">Schedule Configuration</h3>
                   <div className="flex gap-4 mb-8">
                     {(['1H', '3H', '6H', 'CUSTOM'] as Interval[]).map(int => (
@@ -443,14 +632,25 @@ const App: React.FC = () => {
                       </button>
                     ))}
                   </div>
-                  <div className="bg-orange-50 p-6 rounded-2xl border border-orange-100">
-                    <div className="flex items-start gap-4">
-                      <div className="w-8 h-8 rounded-full bg-orange-100 text-orange-500 flex items-center justify-center font-bold">!</div>
-                      <div>
-                        <h4 className="font-bold text-slate-800 text-sm mb-1">Webhook Simulation</h4>
-                        <p className="text-xs text-slate-500 leading-relaxed">
-                          De engine checkt automatisch op de geselecteerde uren ({activeHours.length} times/day).
-                          Volgende check: <strong>{activeHours.find(h => h > new Date().getHours()) || activeHours[0]}:00</strong>.
+                  <div className="bg-emerald-50 p-4 md:p-6 rounded-2xl border border-emerald-100">
+                    <div className="flex items-start gap-3 md:gap-4">
+                      <div className="w-8 h-8 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center font-bold shrink-0">✓</div>
+                      <div className="flex-1 min-w-0">
+                        <h4 className="font-bold text-slate-800 text-sm mb-1">Automatische Surf Engine</h4>
+                        <p className="text-xs text-slate-600 leading-relaxed">
+                          De engine draait op de achtergrond en checkt automatisch op de geselecteerde uren ({activeHours.length} keer/dag).
+                          {(() => {
+                            const currentHour = new Date().getHours();
+                            const nextHour = activeHours.find(h => h > currentHour) ?? activeHours.find(h => h >= 0);
+                            return nextHour !== undefined ? (
+                              <> Volgende check: <strong className="text-emerald-700">{String(nextHour).padStart(2, '0')}:00</strong>.</>
+                            ) : (
+                              <> Laatste check van vandaag: <strong className="text-emerald-700">{String(activeHours[activeHours.length - 1]).padStart(2, '0')}:00</strong>.</>
+                            );
+                          })()}
+                        </p>
+                        <p className="text-[10px] text-slate-500 mt-2 italic">
+                          Surf Scaling campagnes worden automatisch geanalyseerd en aangepast volgens de ingestelde regels.
                         </p>
                       </div>
                     </div>
@@ -466,7 +666,9 @@ const App: React.FC = () => {
                   <div className="bg-white p-6 rounded-[2.5rem] border border-slate-100">
                     <div className="flex flex-col gap-4 mb-6">
                       <div className="flex items-center justify-between px-2">
-                        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Active Campaigns</h3>
+                        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
+                          Campaigns ({filteredCampaigns.length} / {campaigns.length})
+                        </h3>
                         <button
                           onClick={runSurfAnalysis}
                           className="bg-orange-50 text-orange-500 px-4 py-2 rounded-lg text-[10px] font-bold uppercase tracking-widest hover:bg-orange-100 transition-colors"
@@ -475,70 +677,208 @@ const App: React.FC = () => {
                         </button>
                       </div>
 
-                      {/* Restore Filters */}
-                      <div className="flex flex-wrap items-center gap-3 bg-slate-50 p-4 rounded-2xl border border-slate-100">
-                        <select
-                          value={filterObjective}
-                          onChange={(e) => setFilterObjective(e.target.value)}
-                          className="bg-white border-none rounded-xl px-3 py-2 text-[10px] font-bold text-slate-700 outline-none focus:ring-2 ring-slate-900 min-w-[120px]"
-                        >
-                          <option value="ALL">Doel: Alles</option>
-                          <option value="SALES">Sales</option>
-                          <option value="AWARENESS">Awareness</option>
-                          <option value="TRAFFIC">Traffic</option>
-                        </select>
+                      {/* Search Bar */}
+                      <div className="relative">
+                        <Icons.Search />
+                        <input
+                          type="text"
+                          value={campaignSearch}
+                          onChange={(e) => setCampaignSearch(e.target.value)}
+                          placeholder="Zoek campagnes..."
+                          className="w-full pl-10 pr-4 py-3 bg-slate-50 rounded-xl border border-slate-100 text-sm font-bold text-slate-800 outline-none focus:ring-2 ring-slate-900 focus:bg-white"
+                        />
+                      </div>
 
-                        <div className="flex items-center gap-2 bg-white px-3 py-2 rounded-xl">
-                          <span className="text-[9px] font-black text-slate-400 uppercase">Min Spend:</span>
-                          <input
-                            type="number"
-                            value={filterMinSpend}
-                            onChange={(e) => setFilterMinSpend(Number(e.target.value))}
-                            className="w-16 bg-transparent text-[10px] font-bold text-slate-900 outline-none"
-                            placeholder="0"
-                          />
+                      {/* Advanced Filters */}
+                      <div className="bg-slate-50 p-3 md:p-4 rounded-xl md:rounded-2xl border border-slate-100">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2 md:gap-3 mb-3">
+                          <select
+                            value={filterObjective}
+                            onChange={(e) => setFilterObjective(e.target.value)}
+                            className="bg-white border-none rounded-xl px-3 py-2 text-[10px] font-bold text-slate-700 outline-none focus:ring-2 ring-slate-900"
+                          >
+                            <option value="ALL">Doel: Alles</option>
+                            <option value="SALES">Sales</option>
+                            <option value="AWARENESS">Awareness</option>
+                            <option value="TRAFFIC">Traffic</option>
+                          </select>
+
+                          <select
+                            value={filterStatus}
+                            onChange={(e) => setFilterStatus(e.target.value)}
+                            className="bg-white border-none rounded-xl px-3 py-2 text-[10px] font-bold text-slate-700 outline-none focus:ring-2 ring-slate-900"
+                          >
+                            <option value="ALL">Status: Alles</option>
+                            <option value="ACTIVE">Actief</option>
+                            <option value="PAUSED">Gepauzeerd</option>
+                          </select>
+
+                          <select
+                            value={filterSurfScaling}
+                            onChange={(e) => setFilterSurfScaling(e.target.value)}
+                            className="bg-white border-none rounded-xl px-3 py-2 text-[10px] font-bold text-slate-700 outline-none focus:ring-2 ring-slate-900"
+                          >
+                            <option value="ALL">Surf: Alles</option>
+                            <option value="YES">Surf Actief</option>
+                            <option value="NO">Geen Surf</option>
+                          </select>
+
+                          <select
+                            value={`${sortBy}-${sortOrder}`}
+                            onChange={(e) => {
+                              const [by, order] = e.target.value.split('-');
+                              setSortBy(by);
+                              setSortOrder(order as 'asc' | 'desc');
+                            }}
+                            className="bg-white border-none rounded-xl px-3 py-2 text-[10px] font-bold text-slate-700 outline-none focus:ring-2 ring-slate-900"
+                          >
+                            <option value="spend-desc">Sorteer: Spend ↓</option>
+                            <option value="spend-asc">Sorteer: Spend ↑</option>
+                            <option value="roas-desc">Sorteer: ROAS ↓</option>
+                            <option value="roas-asc">Sorteer: ROAS ↑</option>
+                            <option value="cpa-asc">Sorteer: CPA ↑</option>
+                            <option value="cpa-desc">Sorteer: CPA ↓</option>
+                            <option value="name-asc">Sorteer: Naam A-Z</option>
+                            <option value="name-desc">Sorteer: Naam Z-A</option>
+                          </select>
+
+                          <button
+                            onClick={() => {
+                              setFilterObjective('ALL');
+                              setFilterStatus('ALL');
+                              setFilterActiveOnly(false);
+                              setFilterMinSpend(0);
+                              setFilterMinRoas(0);
+                              setFilterMaxCpa(10000);
+                              setFilterSurfScaling('ALL');
+                              setCampaignSearch('');
+                              setSortBy('spend');
+                              setSortOrder('desc');
+                            }}
+                            className="bg-white text-slate-400 px-3 py-2 rounded-xl text-[9px] font-black uppercase tracking-widest hover:bg-slate-100 transition-all border border-slate-200"
+                          >
+                            Reset
+                          </button>
                         </div>
 
-                        <button
-                          onClick={() => setFilterActiveOnly(!filterActiveOnly)}
-                          className={`px-3 py-2 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all ${filterActiveOnly ? 'bg-slate-900 text-white' : 'bg-white text-slate-400 hover:text-slate-600'}`}
-                        >
-                          {filterActiveOnly ? 'Alleen Actief' : 'Alle Status'}
-                        </button>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-2 md:gap-3">
+                          <div className="flex items-center gap-2 bg-white px-2 md:px-3 py-2 rounded-lg md:rounded-xl">
+                            <span className="text-[8px] md:text-[9px] font-black text-slate-400 uppercase whitespace-nowrap">Min Spend:</span>
+                            <input
+                              type="number"
+                              value={filterMinSpend}
+                              onChange={(e) => setFilterMinSpend(Number(e.target.value))}
+                              className="w-full min-w-0 bg-transparent text-[9px] md:text-[10px] font-bold text-slate-900 outline-none"
+                              placeholder="0"
+                            />
+                          </div>
+
+                          <div className="flex items-center gap-2 bg-white px-2 md:px-3 py-2 rounded-lg md:rounded-xl">
+                            <span className="text-[8px] md:text-[9px] font-black text-slate-400 uppercase whitespace-nowrap">Min ROAS:</span>
+                            <input
+                              type="number"
+                              step="0.1"
+                              value={filterMinRoas}
+                              onChange={(e) => setFilterMinRoas(Number(e.target.value))}
+                              className="w-full min-w-0 bg-transparent text-[9px] md:text-[10px] font-bold text-slate-900 outline-none"
+                              placeholder="0"
+                            />
+                          </div>
+
+                          <div className="flex items-center gap-2 bg-white px-2 md:px-3 py-2 rounded-lg md:rounded-xl">
+                            <span className="text-[8px] md:text-[9px] font-black text-slate-400 uppercase whitespace-nowrap">Max CPA:</span>
+                            <input
+                              type="number"
+                              value={filterMaxCpa}
+                              onChange={(e) => setFilterMaxCpa(Number(e.target.value))}
+                              className="w-full min-w-0 bg-transparent text-[9px] md:text-[10px] font-bold text-slate-900 outline-none"
+                              placeholder="10000"
+                            />
+                          </div>
+
+                          <button
+                            onClick={() => setFilterActiveOnly(!filterActiveOnly)}
+                            className={`px-2 md:px-3 py-2 rounded-lg md:rounded-xl text-[8px] md:text-[9px] font-black uppercase tracking-widest transition-all ${filterActiveOnly ? 'bg-slate-900 text-white' : 'bg-white text-slate-400 hover:text-slate-600 border border-slate-200'}`}
+                          >
+                            {filterActiveOnly ? '✓ Actief' : 'Alle'}
+                          </button>
+                        </div>
                       </div>
                     </div>
 
                     <div className="space-y-3">
-                      {filteredCampaigns.map(campaign => (
-                        <div key={campaign.id} className="group bg-slate-50 hover:bg-white p-5 rounded-3xl border border-slate-100 transition-all hover:shadow-lg hover:shadow-slate-200/50 flex items-center justify-between">
-                          <div className="flex items-center gap-4">
-                            <div className={`w-12 h-12 rounded-2xl flex items-center justify-center text-lg font-black ${campaign.isSurfScaling ? 'bg-orange-500 text-white shadow-lg shadow-orange-500/30' : 'bg-slate-200 text-slate-400'}`}>
-                              {campaign.isSurfScaling ? 'S' : 'M'}
+                      {filteredCampaigns.length === 0 ? (
+                        <div className="bg-slate-50 p-10 rounded-3xl border border-slate-100 text-center">
+                          <p className="text-slate-400 font-bold uppercase text-xs tracking-widest">Geen campagnes gevonden met de huidige filters</p>
+                        </div>
+                      ) : (
+                        filteredCampaigns.map(campaign => (
+                          <div key={campaign.id} className="group bg-slate-50 hover:bg-white p-4 md:p-5 rounded-2xl md:rounded-3xl border border-slate-100 transition-all hover:shadow-lg hover:shadow-slate-200/50">
+                            <div className="flex items-center justify-between mb-3">
+                              <div className="flex items-center gap-3 md:gap-4 flex-1 min-w-0">
+                                <div className={`w-10 h-10 md:w-12 md:h-12 rounded-xl md:rounded-2xl flex items-center justify-center text-base md:text-lg font-black shrink-0 ${campaign.isSurfScaling ? 'bg-orange-500 text-white shadow-lg shadow-orange-500/30' : 'bg-slate-200 text-slate-400'}`}>
+                                  {campaign.isSurfScaling ? 'S' : 'M'}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-2">
+                                    <h4 className="font-bold text-slate-800 text-xs md:text-sm truncate">{campaign.name}</h4>
+                                    <button
+                                      onClick={(e) => handleStarToggle(e, campaign.id)}
+                                      className="shrink-0 p-1 hover:bg-slate-100 rounded transition-colors"
+                                    >
+                                      <Icons.Star active={campaign.isStarred || false} />
+                                    </button>
+                                  </div>
+                                  <div className="flex items-center gap-2 mt-1 flex-wrap">
+                                    <span className={`text-[8px] md:text-[9px] font-bold px-2 py-0.5 rounded border ${campaign.status === 'ACTIVE' ? 'bg-emerald-50 text-emerald-600 border-emerald-200' : 'bg-slate-100 text-slate-500 border-slate-200'}`}>
+                                      {campaign.status}
+                                    </span>
+                                    <span className="text-[8px] md:text-[9px] font-bold text-slate-400 bg-white px-2 py-0.5 rounded border border-slate-100">
+                                      {campaign.objective.replace('OUTCOME_', '').replace('_', ' ')}
+                                    </span>
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-3 md:gap-4 shrink-0">
+                                <button
+                                  onClick={() => handleSurfToggle(campaign.id)}
+                                  className={`w-12 md:w-14 h-7 md:h-8 rounded-full transition-all relative ${campaign.isSurfScaling ? 'bg-slate-900' : 'bg-slate-300'}`}
+                                >
+                                  <div className={`absolute top-0.5 md:top-1 w-5 md:w-6 h-5 md:h-6 bg-white rounded-full transition-all shadow-sm ${campaign.isSurfScaling ? 'left-6 md:left-7' : 'left-0.5 md:left-1'}`} />
+                                </button>
+                              </div>
                             </div>
-                            <div>
-                              <h4 className="font-bold text-slate-800 text-sm">{campaign.name}</h4>
-                              <div className="flex items-center gap-3 mt-1">
-                                <span className="text-[10px] font-bold text-slate-400 bg-white px-2 py-1 rounded border border-slate-100">ROAS: {campaign.roas}</span>
-                                <span className="text-[10px] font-bold text-slate-400 bg-white px-2 py-1 rounded border border-slate-100">CPA: €{campaign.cpa}</span>
+
+                            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2 md:gap-3 mt-3">
+                              <div className="bg-white p-2 md:p-3 rounded-lg md:rounded-xl border border-slate-100">
+                                <p className="text-[7px] md:text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1">Budget</p>
+                                <p className="font-black text-slate-800 text-xs md:text-sm">€{campaign.budget.toFixed(2)}</p>
+                              </div>
+                              <div className="bg-white p-2 md:p-3 rounded-lg md:rounded-xl border border-slate-100">
+                                <p className="text-[7px] md:text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1">Spend</p>
+                                <p className="font-black text-slate-800 text-xs md:text-sm">€{campaign.spend.toFixed(2)}</p>
+                              </div>
+                              <div className={`bg-white p-2 md:p-3 rounded-lg md:rounded-xl border ${campaign.roas >= 4 ? 'border-emerald-200 bg-emerald-50' : 'border-slate-100'}`}>
+                                <p className="text-[7px] md:text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1">ROAS</p>
+                                <p className={`font-black text-xs md:text-sm ${campaign.roas >= 4 ? 'text-emerald-600' : 'text-slate-800'}`}>
+                                  {campaign.roas.toFixed(2)}x
+                                </p>
+                              </div>
+                              <div className="bg-white p-2 md:p-3 rounded-lg md:rounded-xl border border-slate-100">
+                                <p className="text-[7px] md:text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1">CPA</p>
+                                <p className="font-black text-slate-800 text-xs md:text-sm">
+                                  {campaign.cpa > 0 ? `€${campaign.cpa.toFixed(2)}` : '-'}
+                                </p>
+                              </div>
+                              <div className="bg-white p-2 md:p-3 rounded-lg md:rounded-xl border border-slate-100">
+                                <p className="text-[7px] md:text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1">Conversions</p>
+                                <p className="font-black text-slate-800 text-xs md:text-sm">{campaign.conversions || 0}</p>
                               </div>
                             </div>
                           </div>
-
-                          <div className="flex items-center gap-6">
-                            <div className="text-right hidden sm:block">
-                              <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Budget</p>
-                              <p className="font-black text-slate-800">€{campaign.budget.toFixed(2)}</p>
-                            </div>
-
-                            <button
-                              onClick={() => handleSurfToggle(campaign.id)}
-                              className={`w-14 h-8 rounded-full transition-all relative ${campaign.isSurfScaling ? 'bg-slate-900' : 'bg-slate-300'}`}
-                            >
-                              <div className={`absolute top-1 w-6 h-6 bg-white rounded-full transition-all shadow-sm ${campaign.isSurfScaling ? 'left-7' : 'left-1'}`} />
-                            </button>
-                          </div>
-                        </div>
-                      ))}
+                        ))
+                      )}
                     </div>
                   </div>
 
@@ -562,17 +902,17 @@ const App: React.FC = () => {
 
                 {/* RIGHT COLUMN: Tools & Charts */}
                 <div className="space-y-6">
-                  <div className="bg-white p-6 rounded-[2.5rem] border border-slate-100">
-                    <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-6">Surf Wave</h3>
-                    <SurfChart />
+                  <div className="bg-white p-4 md:p-6 rounded-2xl md:rounded-[2.5rem] border border-slate-100">
+                    <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4 md:mb-6">Surf Wave</h3>
+                    <SurfChart logs={surfLogs} />
                   </div>
 
-                  <div className="bg-white p-6 rounded-[2.5rem] border border-slate-100">
-                    <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-6">Rules Engine</h3>
+                  <div className="bg-white p-4 md:p-6 rounded-2xl md:rounded-[2.5rem] border border-slate-100">
+                    <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4 md:mb-6">Rules Engine</h3>
                     <RuleConfig rules={rules} onSave={setRules} />
                   </div>
 
-                  <div className="bg-white p-6 rounded-[2.5rem] border border-slate-100">
+                  <div className="bg-white p-4 md:p-6 rounded-2xl md:rounded-[2.5rem] border border-slate-100">
                     <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Activity Log</h3>
                     <div className="space-y-3 max-h-60 overflow-y-auto pr-2 custom-scrollbar">
                       {surfLogs.length === 0 ? (
@@ -585,7 +925,12 @@ const App: React.FC = () => {
                               Budget: €{log.oldBudget.toFixed(2)} ➔ €{log.newBudget.toFixed(2)}
                             </p>
                             <p className="text-[8px] text-slate-300 uppercase tracking-widest mt-1">
-                              {new Date(log.timestamp).toLocaleTimeString()}
+                              {new Date(log.timestamp).toLocaleString('nl-NL', { 
+                                day: '2-digit', 
+                                month: '2-digit', 
+                                hour: '2-digit', 
+                                minute: '2-digit' 
+                              })}
                             </p>
                           </div>
                         ))
@@ -597,8 +942,143 @@ const App: React.FC = () => {
             </div>
           )}
 
+          {activeTab === AppTab.SCALESURFING && (
+            <div className="space-y-6 md:space-y-8">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-2xl font-black text-slate-900">Scalesurfing</h2>
+                  <p className="text-slate-400 text-xs font-bold uppercase tracking-widest">Account Analyse & Opportunities</p>
+                </div>
+                <button
+                  onClick={handleAnalyzeAccount}
+                  disabled={isSyncing || !selectedAccountId}
+                  className="bg-orange-500 text-white px-4 md:px-6 py-2 md:py-3 rounded-xl text-[10px] md:text-xs font-bold uppercase tracking-widest hover:bg-orange-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-orange-500/20"
+                >
+                  {isSyncing ? 'Analyseren...' : 'Analyseer Account'}
+                </button>
+              </div>
+
+              {accountAnalysis ? (
+                <div className="space-y-6">
+                  {/* Performance Overview */}
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                    <div className="bg-white p-4 md:p-6 rounded-2xl md:rounded-3xl border border-slate-100 shadow-sm">
+                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Totale Spend</p>
+                      <h3 className="text-xl md:text-2xl font-black text-slate-800">€{accountAnalysis.performance.totalSpend.toFixed(2)}</h3>
+                    </div>
+                    <div className="bg-white p-4 md:p-6 rounded-2xl md:rounded-3xl border border-slate-100 shadow-sm">
+                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Gem. ROAS</p>
+                      <h3 className={`text-xl md:text-2xl font-black ${accountAnalysis.performance.avgRoas >= 4 ? 'text-emerald-500' : 'text-slate-800'}`}>
+                        {accountAnalysis.performance.avgRoas.toFixed(2)}x
+                      </h3>
+                    </div>
+                    <div className="bg-white p-4 md:p-6 rounded-2xl md:rounded-3xl border border-slate-100 shadow-sm">
+                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Actief</p>
+                      <h3 className="text-xl md:text-2xl font-black text-slate-800">{accountAnalysis.performance.activeCampaigns}</h3>
+                    </div>
+                    <div className="bg-white p-4 md:p-6 rounded-2xl md:rounded-3xl border border-slate-100 shadow-sm">
+                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Gepauzeerd</p>
+                      <h3 className="text-xl md:text-2xl font-black text-slate-800">{accountAnalysis.performance.pausedCampaigns}</h3>
+                    </div>
+                  </div>
+
+                  {/* Scaling Potential */}
+                  <div className="bg-white p-6 md:p-8 rounded-2xl md:rounded-3xl border border-slate-100 shadow-sm">
+                    <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Scaling Potentieel</h3>
+                    <div className={`inline-block px-4 py-2 rounded-xl font-black text-sm ${
+                      accountAnalysis.opportunities.scalingPotential === 'HIGH' ? 'bg-emerald-100 text-emerald-700' :
+                      accountAnalysis.opportunities.scalingPotential === 'MEDIUM' ? 'bg-orange-100 text-orange-700' :
+                      'bg-slate-100 text-slate-700'
+                    }`}>
+                      {accountAnalysis.opportunities.scalingPotential}
+                    </div>
+                  </div>
+
+                  {/* Top Campaigns */}
+                  {accountAnalysis.opportunities.topCampaigns.length > 0 && (
+                    <div className="bg-white p-6 md:p-8 rounded-2xl md:rounded-3xl border border-slate-100 shadow-sm">
+                      <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Top Performers</h3>
+                      <div className="space-y-3">
+                        {accountAnalysis.opportunities.topCampaigns.map(c => (
+                          <div key={c.id} className="flex items-center justify-between p-4 bg-slate-50 rounded-xl border border-slate-100">
+                            <div>
+                              <h4 className="font-bold text-slate-800 text-sm">{c.name}</h4>
+                              <p className="text-xs text-slate-400">ROAS: {c.roas.toFixed(2)}x | Spend: €{c.spend.toFixed(2)}</p>
+                            </div>
+                            <span className="text-emerald-600 font-black text-sm">{c.roas.toFixed(2)}x</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Bottlenecks */}
+                  {accountAnalysis.opportunities.bottlenecks.length > 0 && (
+                    <div className="bg-orange-50 p-6 md:p-8 rounded-2xl md:rounded-3xl border border-orange-100 shadow-sm">
+                      <h3 className="text-[10px] font-black text-orange-600 uppercase tracking-widest mb-4">Bottlenecks & Risico's</h3>
+                      <ul className="space-y-2">
+                        {accountAnalysis.opportunities.bottlenecks.map((bottleneck, i) => (
+                          <li key={i} className="flex items-start gap-3 text-sm text-slate-700">
+                            <span className="text-orange-500 mt-1">⚠</span>
+                            <span>{bottleneck}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {/* Recommendations */}
+                  {accountAnalysis.opportunities.recommendations.length > 0 && (
+                    <div className="bg-slate-900 text-white p-6 md:p-8 rounded-2xl md:rounded-3xl border border-slate-800 shadow-xl">
+                      <h3 className="text-[10px] font-black text-slate-300 uppercase tracking-widest mb-4">Aanbevelingen</h3>
+                      <ul className="space-y-3">
+                        {accountAnalysis.opportunities.recommendations.map((rec, i) => (
+                          <li key={i} className="flex items-start gap-3 text-sm text-slate-200">
+                            <span className="text-orange-500 mt-1">→</span>
+                            <span>{rec}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {/* Permissions */}
+                  <div className="bg-white p-6 md:p-8 rounded-2xl md:rounded-3xl border border-slate-100 shadow-sm">
+                    <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Account Toegangen</h3>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      <div className="flex items-center gap-2">
+                        <div className={`w-2 h-2 rounded-full ${accountAnalysis.permissions.hasCampaignAccess ? 'bg-emerald-500' : 'bg-red-500'}`}></div>
+                        <span className="text-xs font-bold text-slate-600">Campaigns</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <div className={`w-2 h-2 rounded-full ${accountAnalysis.permissions.hasInsightsAccess ? 'bg-emerald-500' : 'bg-red-500'}`}></div>
+                        <span className="text-xs font-bold text-slate-600">Insights</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <div className={`w-2 h-2 rounded-full ${accountAnalysis.permissions.hasBudgetAccess ? 'bg-emerald-500' : 'bg-red-500'}`}></div>
+                        <span className="text-xs font-bold text-slate-600">Budget</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <div className={`w-2 h-2 rounded-full ${accountAnalysis.permissions.hasEditAccess ? 'bg-emerald-500' : 'bg-red-500'}`}></div>
+                        <span className="text-xs font-bold text-slate-600">Edit</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-white p-12 md:p-16 rounded-2xl md:rounded-3xl border border-slate-100 text-center">
+                  <div className="w-16 h-16 bg-slate-50 rounded-full flex items-center justify-center mx-auto mb-4 text-slate-300">
+                    <Icons.Campaign />
+                  </div>
+                  <p className="text-slate-400 font-bold uppercase text-xs tracking-widest mb-2">Geen analyse beschikbaar</p>
+                  <p className="text-slate-500 text-sm">Klik op "Analyseer Account" om een diepgaande analyse te starten</p>
+                </div>
+              )}
+            </div>
+          )}
+
           {activeTab === AppTab.SETTINGS && (
-            <div className="bg-white p-10 rounded-[2.5rem] border border-slate-100 shadow-sm max-w-4xl">
+            <div className="bg-white p-6 md:p-10 rounded-2xl md:rounded-[2.5rem] border border-slate-100 shadow-sm max-w-4xl">
               <h3 className="text-xl font-black mb-6 flex items-center gap-2 text-slate-800">
                 <Icons.Settings /> Systeem Instellingen
               </h3>
@@ -618,15 +1098,18 @@ const App: React.FC = () => {
                   </div>
 
                   <div>
-                    <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Webhook URL</label>
+                    <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Webhook URL (Make.com)</label>
                     <input
                       type="text"
                       value={webhookUrl}
                       onChange={(e) => setWebhookUrl(e.target.value)}
                       className="w-full p-4 bg-slate-50 rounded-2xl border border-slate-200 focus:ring-2 ring-slate-900 outline-none font-mono text-xs"
-                      placeholder="https://hooks.slack.com/services/..."
+                      placeholder="https://hook.eu1.make.com/..."
                     />
-                    <p className="text-[10px] text-slate-400 mt-2 italic font-medium leading-relaxed">Optioneel: Stuur notificaties naar Slack of Discord.</p>
+                    <p className="text-[10px] text-slate-400 mt-2 italic font-medium leading-relaxed">
+                      Make.com webhook voor email verzending naar Benjamin@nodefy.nl. 
+                      Standaard ingesteld op: <code className="bg-slate-100 px-1 rounded text-[9px]">hook.eu1.make.com/6g8jta9799el82t7rg0i3enx8rh2ey62</code>
+                    </p>
                   </div>
 
                   <button
