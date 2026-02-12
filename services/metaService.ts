@@ -1,4 +1,4 @@
-import { AdAccount, Campaign, DatePeriod } from "../types";
+import { AdAccount, Campaign, DatePeriod, DataSources } from "../types";
 import { getCachedCampaigns, cacheCampaigns, saveSetting } from './db';
 
 const API_VERSION = "v21.0";
@@ -143,4 +143,64 @@ export const fetchMetaCampaignsForAccount = async (accountId: string, period: Da
     console.error("Fetch error", error);
     return { data: [], error: "Oeps! Iets ging verkeerd bij het ophalen van data. Check je token en internet." };
   }
+};
+
+/**
+ * Fetch campaigns using multi-source configuration
+ * This is the new recommended way to fetch campaigns that supports Meta, Triple Whale, or both
+ */
+export const fetchCampaignsForAccount = async (
+  accountId: string,
+  dataSources: DataSources | undefined,
+  period: DatePeriod,
+  // Legacy support: if dataSources is not provided, use legacy adAccountId
+  legacyAdAccountId?: string
+): Promise<{ data: Campaign[], error: string | null }> => {
+  // If no dataSources but legacy adAccountId exists, use legacy flow
+  if (!dataSources && legacyAdAccountId) {
+    return fetchMetaCampaignsForAccount(legacyAdAccountId, period);
+  }
+
+  // If no dataSources at all, return error
+  if (!dataSources) {
+    return { 
+      data: [], 
+      error: 'Geen data sources geconfigureerd voor dit account.' 
+    };
+  }
+
+  // Use aggregator for multi-source support
+  const { fetchAggregatedCampaigns } = await import('./dataAggregatorService');
+  
+  // Prepare data sources config
+  const config: {
+    meta?: {
+      enabled: boolean;
+      adAccountId: string;
+      accessToken: string;
+    };
+    tripleWhale?: {
+      enabled: boolean;
+      apiKey: string;
+      storeId?: string;
+    };
+  } = {};
+
+  if (dataSources.meta?.enabled) {
+    config.meta = {
+      enabled: true,
+      adAccountId: dataSources.meta.adAccountId,
+      accessToken: getStoredToken() // Use stored token
+    };
+  }
+
+  if (dataSources.tripleWhale?.enabled) {
+    config.tripleWhale = {
+      enabled: true,
+      apiKey: dataSources.tripleWhale.apiKey,
+      storeId: dataSources.tripleWhale.storeId
+    };
+  }
+
+  return fetchAggregatedCampaigns(accountId, config, period);
 };

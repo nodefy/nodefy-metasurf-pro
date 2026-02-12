@@ -8,6 +8,24 @@ export interface AccountSettings {
   alertThreshold: number;
 }
 
+// Data Source Configuration
+export interface MetaDataSource {
+  enabled: boolean;
+  adAccountId: string;
+  accessToken: string;
+}
+
+export interface TripleWhaleDataSource {
+  enabled: boolean;
+  apiKey: string;
+  storeId?: string;
+}
+
+export interface DataSources {
+  meta?: MetaDataSource;
+  tripleWhale?: TripleWhaleDataSource;
+}
+
 export interface AdAccount {
   id: string;
   name: string;
@@ -15,6 +33,11 @@ export interface AdAccount {
   isStarred?: boolean;
   currency: string;
   settings?: AccountSettings;
+  // Multi-source data configuration
+  dataSources?: DataSources;
+  // Legacy support: if dataSources is not set, assume only Meta
+  // Old accounts will have adAccountId directly on the account
+  adAccountId?: string; // Legacy field for backwards compatibility
 }
 
 export interface Campaign {
@@ -33,6 +56,12 @@ export interface Campaign {
   isStarred?: boolean;
   minRoas: number;
   objective: string;
+  // Source tracking for aggregated campaigns
+  sourceIds?: {
+    meta?: string;
+    tripleWhale?: string;
+  };
+  revenue?: number; // Revenue from Triple Whale (more accurate)
 }
 
 // Added ScalingRule interface to fix import error in constants.tsx
@@ -130,4 +159,51 @@ export interface SurfLog {
   oldBudget: number;
   newBudget: number;
   metricValue: number;
+}
+
+// Triple Whale specific types
+export interface TripleWhaleCampaign {
+  campaignId: string;
+  campaignName: string;
+  spend: number;
+  revenue: number;
+  roas: number;
+  orders: number; // Conversions in Triple Whale
+  cpc?: number;
+  ctr?: number;
+  status?: string;
+}
+
+export interface TripleWhaleInsights {
+  campaigns: TripleWhaleCampaign[];
+  period: DatePeriod;
+  timestamp: number;
+}
+
+// Aggregated campaign data from multiple sources
+export interface AggregatedCampaignData {
+  meta?: {
+    id: string;
+    name: string;
+    spend: number;
+    roas: number;
+    conversions: number;
+    cpc: number;
+    ctr: number;
+    cpa: number;
+    status: 'ACTIVE' | 'PAUSED';
+    budget: number;
+    objective: string;
+  };
+  tripleWhale?: {
+    campaignId: string;
+    campaignName: string;
+    spend: number;
+    revenue: number;
+    roas: number;
+    orders: number;
+    cpc?: number;
+    ctr?: number;
+    status?: string;
+  };
 }

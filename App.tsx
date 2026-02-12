@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { AdAccount, Campaign, AppTab, DatePeriod, Notification, Rule, SurfLog, User } from './types';
-import { fetchMetaAdAccounts, fetchMetaCampaignsForAccount, saveToken } from './services/metaService';
+import { fetchMetaAdAccounts, fetchMetaCampaignsForAccount, fetchCampaignsForAccount, saveToken } from './services/metaService';
+import { migrateAccountConfig } from './services/dataAggregatorService';
+import { testTripleWhaleConnection } from './services/tripleWhaleService';
 import { sendSurfscaleNotification } from './services/notificationService';
 import { evaluateRules } from './services/surfscaleService';
 import SurfChart from './components/SurfChart';
@@ -66,6 +68,11 @@ const App: React.FC = () => {
   // Accounts UI State
   const [showOtherAccounts, setShowOtherAccounts] = useState(false);
   const [accountSearch, setAccountSearch] = useState('');
+  const [configuringAccountId, setConfiguringAccountId] = useState<string | null>(null);
+  const [tripleWhaleApiKey, setTripleWhaleApiKey] = useState('');
+  const [tripleWhaleStoreId, setTripleWhaleStoreId] = useState('');
+  const [metaEnabled, setMetaEnabled] = useState(true);
+  const [tripleWhaleEnabled, setTripleWhaleEnabled] = useState(false);
 
   // Settings State
   const [apiTokenInput, setApiTokenInput] = useState('');
@@ -150,11 +157,20 @@ const App: React.FC = () => {
         return;
       }
       const db = getDB();
-      const merged = data.map(a => ({
-        ...a,
-        isActive: db.accounts[a.id]?.isActive || false,
-        isStarred: db.accounts[a.id]?.isStarred || false,
-      }));
+      const merged = data.map(a => {
+        const savedAccount = db.accounts[a.id] || {};
+        // Migrate legacy accounts to new format
+        const migrated = migrateAccountConfig({
+          ...a,
+          ...savedAccount,
+          adAccountId: savedAccount.adAccountId || a.id
+        });
+        return {
+          ...migrated,
+          isActive: savedAccount.isActive || false,
+          isStarred: savedAccount.isStarred || false,
+        };
+      });
       setAccounts(merged);
       const lastActive = merged.find(a => a.isActive);
       if (lastActive && !selectedAccountId) setSelectedAccountId(lastActive.id);
@@ -172,7 +188,25 @@ const App: React.FC = () => {
     setCampaigns([]);
 
     try {
-      const { data, error } = await fetchMetaCampaignsForAccount(accountId, period);
+      // Get account with migration support
+      const account = accounts.find(a => a.id === accountId);
+      if (!account) {
+        setAccountError("Account niet gevonden.");
+        setIsSyncing(false);
+        return;
+      }
+
+      // Migrate account config if needed
+      const migratedAccount = migrateAccountConfig(account);
+      
+      // Use new multi-source fetch function
+      const { data, error } = await fetchCampaignsForAccount(
+        accountId,
+        migratedAccount.dataSources,
+        period,
+        migratedAccount.adAccountId // Legacy support
+      );
+
       if (error) {
         setAccountError(error);
       } else {
@@ -184,12 +218,12 @@ const App: React.FC = () => {
           isStarred: starredIds.includes(c.id)
         })));
       }
-    } catch (e) {
-      setAccountError("Fout bij laden account data.");
+    } catch (e: any) {
+      setAccountError(`Fout bij laden account data: ${e.message || 'Onbekende fout'}`);
     } finally {
       setIsSyncing(false);
     }
-  }, [getDB]);
+  }, [getDB, accounts]);
 
   useEffect(() => {
     // Load Settings & Schedule from DB
@@ -471,10 +505,96 @@ const App: React.FC = () => {
   };
 
   const updateToken = async () => {
-    await saveSetting('api_token', apiTokenInput);
+    await saveToken(apiTokenInput);
     await saveSetting('webhook_url', webhookUrl);
     alert('Instellingen opgeslagen in database!');
     syncAccounts();
+  };
+
+  const openAccountConfig = (accountId: string) => {
+    const account = accounts.find(a => a.id === accountId);
+    if (!account) return;
+    
+    const migrated = migrateAccountConfig(account);
+    setConfiguringAccountId(accountId);
+    setMetaEnabled(migrated.dataSources?.meta?.enabled ?? true);
+    setTripleWhaleEnabled(migrated.dataSources?.tripleWhale?.enabled ?? false);
+    setTripleWhaleApiKey(migrated.dataSources?.tripleWhale?.apiKey || '');
+    setTripleWhaleStoreId(migrated.dataSources?.tripleWhale?.storeId || '');
+  };
+
+  const saveAccountConfig = async () => {
+    if (!configuringAccountId) return;
+    
+    const account = accounts.find(a => a.id === configuringAccountId);
+    if (!account) return;
+
+    const token = await getSetting<string>('api_token', '');
+    const migrated = migrateAccountConfig(account);
+    
+    const dataSources: {
+      meta?: {
+        enabled: boolean;
+        adAccountId: string;
+        accessToken: string;
+      };
+      tripleWhale?: {
+        enabled: boolean;
+        apiKey: string;
+        storeId?: string;
+      };
+    } = {};
+    
+    if (metaEnabled) {
+      dataSources.meta = {
+        enabled: true,
+        adAccountId: migrated.dataSources?.meta?.adAccountId || account.id,
+        accessToken: token
+      };
+    }
+    
+    if (tripleWhaleEnabled) {
+      if (!tripleWhaleApiKey.trim()) {
+        alert('Triple Whale API Key is verplicht als Triple Whale is ingeschakeld.');
+        return;
+      }
+      
+      // Test connection
+      setIsSyncing(true);
+      const { success, error } = await testTripleWhaleConnection(tripleWhaleApiKey, tripleWhaleStoreId || undefined);
+      setIsSyncing(false);
+      
+      if (!success) {
+        alert(`Triple Whale verbinding mislukt: ${error}\n\nWil je doorgaan met opslaan?`);
+        // User can still save even if test fails
+      }
+      
+      dataSources.tripleWhale = {
+        enabled: true,
+        apiKey: tripleWhaleApiKey.trim(),
+        storeId: tripleWhaleStoreId.trim() || undefined
+      };
+    }
+
+    // Save to DB
+    saveToDB('accounts', configuringAccountId, {
+      dataSources: Object.keys(dataSources).length > 0 ? dataSources : undefined
+    });
+
+    // Update local state
+    setAccounts(prev => prev.map(a => 
+      a.id === configuringAccountId 
+        ? { ...a, dataSources: Object.keys(dataSources).length > 0 ? dataSources : undefined }
+        : a
+    ));
+
+    setConfiguringAccountId(null);
+    alert('Account configuratie opgeslagen!');
+    
+    // Refresh campaigns if this is the active account
+    if (selectedAccountId === configuringAccountId) {
+      syncCampaigns(configuringAccountId, selectedPeriod);
+    }
   };
 
   const starredAccountsList = accounts.filter(a => a.isStarred);
@@ -1180,16 +1300,33 @@ const App: React.FC = () => {
                   </h3>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     {starredAccountsList.map(acc => (
-                      <button key={acc.id} onClick={() => selectAccount(acc.id)} className={`relative p-6 rounded-3xl border-2 text-left transition-all group ${acc.isActive ? 'border-slate-900 bg-white shadow-xl scale-[1.02]' : 'border-slate-100 bg-white hover:border-slate-300'}`}>
-                        <button onClick={(e) => toggleStar(e, acc.id)} className="absolute top-6 right-6 p-2 hover:bg-slate-50 rounded-full">
-                          <Icons.Star active={true} />
-                        </button>
-                        <div className="flex justify-between items-start mb-4">
-                          <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-black transition-colors ${acc.isActive ? 'bg-slate-900 text-white' : 'bg-slate-50 text-slate-400'}`}>{acc.name.charAt(0)}</div>
+                      <div key={acc.id} className={`relative p-6 rounded-3xl border-2 text-left transition-all group ${acc.isActive ? 'border-slate-900 bg-white shadow-xl scale-[1.02]' : 'border-slate-100 bg-white hover:border-slate-300'}`}>
+                        <div className="absolute top-6 right-6 flex gap-2">
+                          <button onClick={(e) => { e.stopPropagation(); openAccountConfig(acc.id); }} className="p-2 hover:bg-slate-50 rounded-full" title="Configureren">
+                            <Icons.Settings />
+                          </button>
+                          <button onClick={(e) => toggleStar(e, acc.id)} className="p-2 hover:bg-slate-50 rounded-full">
+                            <Icons.Star active={true} />
+                          </button>
                         </div>
-                        <h4 className="font-black text-slate-800 transition-colors pr-8">{acc.name}</h4>
-                        <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">{acc.id}</p>
-                      </button>
+                        <button onClick={() => selectAccount(acc.id)} className="w-full text-left">
+                          <div className="flex justify-between items-start mb-4">
+                            <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-black transition-colors ${acc.isActive ? 'bg-slate-900 text-white' : 'bg-slate-50 text-slate-400'}`}>{acc.name.charAt(0)}</div>
+                          </div>
+                          <h4 className="font-black text-slate-800 transition-colors pr-8">{acc.name}</h4>
+                          <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">{acc.id}</p>
+                          {(acc.dataSources?.meta?.enabled || acc.dataSources?.tripleWhale?.enabled) && (
+                            <div className="mt-2 flex gap-1 flex-wrap">
+                              {acc.dataSources?.meta?.enabled && (
+                                <span className="text-[8px] bg-blue-100 text-blue-700 px-2 py-1 rounded font-bold">Meta</span>
+                              )}
+                              {acc.dataSources?.tripleWhale?.enabled && (
+                                <span className="text-[8px] bg-purple-100 text-purple-700 px-2 py-1 rounded font-bold">Triple Whale</span>
+                              )}
+                            </div>
+                          )}
+                        </button>
+                      </div>
                     ))}
                   </div>
                 </div>
@@ -1222,24 +1359,158 @@ const App: React.FC = () => {
                 {showOtherAccounts && (
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                     {otherAccountsList.map(acc => (
-                      <button key={acc.id} onClick={() => selectAccount(acc.id)} className={`relative p-4 rounded-2xl border transition-all group ${acc.isActive ? 'border-slate-900 bg-white shadow-md' : 'border-slate-100 bg-white hover:border-slate-200'}`}>
-                        <button onClick={(e) => toggleStar(e, acc.id)} className="absolute top-4 right-4 p-1 hover:bg-slate-50 rounded-full">
-                          <Icons.Star active={false} />
-                        </button>
-                        <div className="flex items-center gap-3">
-                          <div className={`w-8 h-8 rounded-lg flex items-center justify-center font-black text-[10px] ${acc.isActive ? 'bg-slate-900 text-white' : 'bg-slate-50 text-slate-300'}`}>{acc.name.charAt(0)}</div>
-                          <div>
-                            <h4 className="font-bold text-xs text-slate-700 truncate max-w-[150px]">{acc.name}</h4>
-                            <p className="text-[8px] text-slate-400 font-bold">{acc.id}</p>
-                          </div>
+                      <div key={acc.id} className={`relative p-4 rounded-2xl border transition-all group ${acc.isActive ? 'border-slate-900 bg-white shadow-md' : 'border-slate-100 bg-white hover:border-slate-200'}`}>
+                        <div className="absolute top-4 right-4 flex gap-1">
+                          <button onClick={(e) => { e.stopPropagation(); openAccountConfig(acc.id); }} className="p-1 hover:bg-slate-50 rounded-full" title="Configureren">
+                            <Icons.Settings />
+                          </button>
+                          <button onClick={(e) => toggleStar(e, acc.id)} className="p-1 hover:bg-slate-50 rounded-full">
+                            <Icons.Star active={false} />
+                          </button>
                         </div>
-                      </button>
+                        <button onClick={() => selectAccount(acc.id)} className="w-full text-left">
+                          <div className="flex items-center gap-3">
+                            <div className={`w-8 h-8 rounded-lg flex items-center justify-center font-black text-[10px] ${acc.isActive ? 'bg-slate-900 text-white' : 'bg-slate-50 text-slate-300'}`}>{acc.name.charAt(0)}</div>
+                            <div className="flex-1 min-w-0">
+                              <h4 className="font-bold text-xs text-slate-700 truncate">{acc.name}</h4>
+                              <p className="text-[8px] text-slate-400 font-bold">{acc.id}</p>
+                              {(acc.dataSources?.meta?.enabled || acc.dataSources?.tripleWhale?.enabled) && (
+                                <div className="mt-1 flex gap-1">
+                                  {acc.dataSources?.meta?.enabled && (
+                                    <span className="text-[7px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded font-bold">Meta</span>
+                                  )}
+                                  {acc.dataSources?.tripleWhale?.enabled && (
+                                    <span className="text-[7px] bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded font-bold">TW</span>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </button>
+                      </div>
                     ))}
                   </div>
                 )}
               </div>
             </div>
-          )}        </div>
+          )}
+
+          {/* Account Configuration Modal */}
+          {configuringAccountId && (
+            <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => setConfiguringAccountId(null)}>
+              <div className="bg-white rounded-3xl p-8 max-w-2xl w-full max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+                <div className="flex items-center justify-between mb-6">
+                  <h3 className="text-xl font-black text-slate-800">Account Configuratie</h3>
+                  <button onClick={() => setConfiguringAccountId(null)} className="text-slate-400 hover:text-slate-800">
+                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                  </button>
+                </div>
+
+                <div className="space-y-6">
+                  <div>
+                    <p className="text-sm text-slate-600 mb-4">
+                      Configureer welke data sources gebruikt moeten worden voor dit account. Je kunt Meta, Triple Whale, of beide gebruiken.
+                    </p>
+                  </div>
+
+                  {/* Meta Configuration */}
+                  <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200">
+                    <div className="flex items-center justify-between mb-3">
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={metaEnabled}
+                          onChange={(e) => setMetaEnabled(e.target.checked)}
+                          className="w-4 h-4 rounded border-slate-300"
+                        />
+                        <span className="font-bold text-slate-800">Meta Ads</span>
+                      </label>
+                      <span className="text-[8px] bg-blue-100 text-blue-700 px-2 py-1 rounded font-bold">STANDARD</span>
+                    </div>
+                    {metaEnabled && (
+                      <p className="text-[10px] text-slate-500 ml-6">
+                        Gebruikt Meta Ads API voor campaign data. Token wordt opgeslagen in algemene instellingen.
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Triple Whale Configuration */}
+                  <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200">
+                    <div className="flex items-center justify-between mb-3">
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={tripleWhaleEnabled}
+                          onChange={(e) => setTripleWhaleEnabled(e.target.checked)}
+                          className="w-4 h-4 rounded border-slate-300"
+                        />
+                        <span className="font-bold text-slate-800">Triple Whale</span>
+                      </label>
+                      <span className="text-[8px] bg-purple-100 text-purple-700 px-2 py-1 rounded font-bold">OPTIONEEL</span>
+                    </div>
+                    {tripleWhaleEnabled && (
+                      <div className="ml-6 space-y-3 mt-3">
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 uppercase tracking-widest mb-1">
+                            Triple Whale API Key *
+                          </label>
+                          <input
+                            type="password"
+                            value={tripleWhaleApiKey}
+                            onChange={(e) => setTripleWhaleApiKey(e.target.value)}
+                            className="w-full p-3 bg-white rounded-xl border border-slate-200 focus:ring-2 ring-slate-900 outline-none font-mono text-xs"
+                            placeholder="tw_..."
+                          />
+                          <p className="text-[9px] text-slate-400 mt-1">Vind je API key in Triple Whale dashboard → Settings → API</p>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 uppercase tracking-widest mb-1">
+                            Store ID (Optioneel)
+                          </label>
+                          <input
+                            type="text"
+                            value={tripleWhaleStoreId}
+                            onChange={(e) => setTripleWhaleStoreId(e.target.value)}
+                            className="w-full p-3 bg-white rounded-xl border border-slate-200 focus:ring-2 ring-slate-900 outline-none font-mono text-xs"
+                            placeholder="store_123"
+                          />
+                          <p className="text-[9px] text-slate-400 mt-1">Alleen nodig als je meerdere stores hebt</p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Info Box */}
+                  <div className="p-4 bg-blue-50 rounded-2xl border border-blue-200">
+                    <p className="text-[10px] text-blue-800 font-bold mb-1">💡 Data Aggregatie Strategie</p>
+                    <p className="text-[9px] text-blue-700 leading-relaxed">
+                      Wanneer beide bronnen zijn ingeschakeld, worden de beste metrics gebruikt:
+                      <br />• Conversies: maximum van beide (voorkomt dubbele telling)
+                      <br />• ROAS: hoogste van beide
+                      <br />• Spend & Revenue: maximum (Triple Whale is vaak accurater voor e-commerce)
+                    </p>
+                  </div>
+
+                  {/* Actions */}
+                  <div className="flex gap-3 pt-4">
+                    <button
+                      onClick={() => setConfiguringAccountId(null)}
+                      className="flex-1 px-6 py-3 bg-slate-100 text-slate-700 rounded-xl font-bold text-xs hover:bg-slate-200 transition-colors"
+                    >
+                      Annuleren
+                    </button>
+                    <button
+                      onClick={saveAccountConfig}
+                      className="flex-1 px-6 py-3 bg-slate-900 text-white rounded-xl font-bold text-xs hover:bg-slate-800 transition-colors"
+                    >
+                      Opslaan
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
       </main>
 
       {/* Mobile Nav */}
